@@ -32,6 +32,7 @@ class GrantItem(BaseModel):
     title: str
     summary: str
     source_url: str
+    grant_type: str = Field(..., description="補助金または助成金の分類")
     deadline: Optional[str] = None
     amount_max: Optional[int] = None
     rate_max: Optional[float] = None
@@ -66,8 +67,10 @@ def build_prompt(req: SearchRequest) -> str:
 - 業種: {req.industry or '指定なし'}
 - 追加キーワード: {req.keywords or '指定なし'}
 
-返却は必ず厳密なJSONで、キー名は title, summary, source_url, confidence, deadline, amount_max, rate_max, area, municipality, industry, reasons の順で出力してください。
-source_url は必ず一次情報（公式のURL）を入れてください。confidence は 0.0〜1.0 の数値で、情報の信頼度を示してください。
+返却は必ず厳密なJSONで、キー名は title, summary, source_url, grant_type, confidence, deadline, amount_max, rate_max, area, municipality, industry, reasons の順で出力してください。
+source_url は必ず一次情報（公式のURL）を入れてください。
+grant_type は「補助金」または「助成金」のいずれかを明記してください。
+confidence は 0.0〜1.0 の数値で、情報の信頼度を示してください。
 
 例（必ずこの形式に従う）:
 ```json
@@ -77,6 +80,7 @@ source_url は必ず一次情報（公式のURL）を入れてください。con
             "title": "助成金A",
             "summary": "〜200字以内の要約",
             "source_url": "https://www.example.go.jp/...",
+            "grant_type": "助成金",
             "confidence": 0.85,
             "deadline": "2025-12-31",
             "amount_max": 1000000,
@@ -105,11 +109,12 @@ def build_json_schema():
                     "items": {
                         "type": "object",
                         "additionalProperties": False,
-                        "required": ["title", "summary", "source_url", "confidence"],
+                        "required": ["title", "summary", "source_url", "grant_type", "confidence"],
                         "properties": {
                             "title": {"type": "string", "maxLength": 160},
                             "summary": {"type": "string", "maxLength": 220},
                             "source_url": {"type": "string"},
+                            "grant_type": {"type": "string", "enum": ["補助金", "助成金"]},
                             "deadline": {"type": ["string", "null"]},
                             "amount_max": {"type": ["integer", "null"], "minimum": 0},
                             "rate_max": {"type": ["number", "null"], "minimum": 0, "maximum": 1},
@@ -241,10 +246,22 @@ async def call_openai(prompt: str, top_k: int):
 
     # Normalize item keys to match GrantItem fields (fallbacks for description/url etc.)
     def normalize_item(i):
+        # grant_type のフォールバック（タイトルから推定）
+        grant_type = i.get("grant_type")
+        if not grant_type:
+            title = i.get("title", "").lower()
+            if "補助金" in title:
+                grant_type = "補助金"
+            elif "助成金" in title:
+                grant_type = "助成金"
+            else:
+                grant_type = "補助金"  # デフォルト
+        
         return {
             "title": i.get("title") or i.get("name") or "",
             "summary": i.get("summary") or i.get("description") or "",
             "source_url": i.get("source_url") or i.get("url") or i.get("link") or "",
+            "grant_type": grant_type,
             "deadline": i.get("deadline") if i.get("deadline") is not None else None,
             "amount_max": i.get("amount_max") if i.get("amount_max") is not None else None,
             "rate_max": i.get("rate_max") if i.get("rate_max") is not None else None,
