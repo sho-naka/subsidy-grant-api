@@ -1,7 +1,9 @@
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field
+from pydantic import Field
 from typing import Optional, List
+from .schemas import SearchRequest, GrantItem, SearchResponse
+from . import utils
 import os, time
 from openai import OpenAI
 import asyncio
@@ -19,32 +21,6 @@ app.add_middleware(
     allow_methods=["GET", "POST", "OPTIONS"],
     allow_headers=["*"],
 )
-
-# ========= 入出力スキーマ =========
-class SearchRequest(BaseModel):
-    prefecture: str = Field(..., description="都道府県")
-    municipality: Optional[str] = Field(None, description="市区町村")
-    industry: Optional[str] = Field(None, description="業種")
-    keywords: Optional[str] = Field(None, description="任意キーワード")
-    top_k: int = Field(10, ge=1, le=20, description="返却件数")
-
-class GrantItem(BaseModel):
-    title: str
-    summary: str
-    source_url: str
-    grant_type: str = Field(..., description="補助金または助成金の分類")
-    deadline: Optional[str] = None
-    amount_max: Optional[int] = None
-    rate_max: Optional[float] = None
-    area: Optional[str] = None
-    municipality: Optional[str] = None
-    industry: Optional[str] = None
-    confidence: float = 0.0
-    reasons: List[str] = []
-
-class SearchResponse(BaseModel):
-    items: List[GrantItem]
-    took_ms: int
 
 # ========= OpenAI設定 =========
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
@@ -180,62 +156,17 @@ async def call_openai(prompt: str, top_k: int):
         raise HTTPException(status_code=502, detail="OpenAI returned no text output")
 
     # Extract JSON from model output (support fenced blocks and arrays/objects)
-    def extract_json_from_text(t: str):
-        # 1) try fenced code block ```json ... ``` or ``` ... ```
-        m = re.search(r"```(?:json)?\s*(.*?)\s*```", t, re.S | re.I)
-        if m:
-            candidate = m.group(1).strip()
-            try:
-                return json.loads(candidate)
-            except Exception:
-                # fall through to generic extractor
-                pass
-
-        # 2) find first { or [ and parse by matching braces/brackets (respecting strings)
-        start = None
-        for i, ch in enumerate(t):
-            if ch in "{[":
-                start = i
-                break
-        if start is None:
-            return None
-
-        stack = []
-        in_str = False
-        esc = False
-        for i in range(start, len(t)):
-            ch = t[i]
-            if in_str:
-                if esc:
-                    esc = False
-                elif ch == "\\":
-                    esc = True
-                elif ch == '"':
-                    in_str = False
-                continue
-            if ch == '"':
-                in_str = True
-                continue
-            if ch == '{':
-                stack.append('}')
-            elif ch == '[':
-                stack.append(']')
-            elif stack and ch == stack[-1]:
-                stack.pop()
-                if not stack:
-                    candidate = t[start: i + 1]
-                    try:
-                        return json.loads(candidate)
-                    except Exception:
-                        return None
-        return None
-
-    parsed_json = extract_json_from_text(text)
+    parsed_json = None
+    try:
+        parsed_json = json.loads(text)
+    except Exception:
+        parsed_json = utils.extract_json_from_text(text)
     if parsed_json is None:
         logging.error("Failed to extract/parse JSON from model output. Snippet: %s", text[:1000])
         raise HTTPException(status_code=502, detail="Model did not return valid JSON")
 
     # Accept either {"items": [...]} or a bare list [...] returned by the model.
+    items_list = []
     if isinstance(parsed_json, dict) and "items" in parsed_json:
         items_list = parsed_json["items"]
     elif isinstance(parsed_json, list):
@@ -244,50 +175,7 @@ async def call_openai(prompt: str, top_k: int):
         logging.error("Parsed JSON missing items or wrong shape: %s", parsed_json)
         raise HTTPException(status_code=502, detail="Unexpected OpenAI response (no items)")
 
-    # Normalize item keys to match GrantItem fields (fallbacks for description/url etc.)
-    def normalize_item(i):
-        # grant_type のフォールバック（タイトルから推定）
-        grant_type = i.get("grant_type")
-        if not grant_type:
-            title = i.get("title", "").lower()
-            if "補助金" in title:
-                grant_type = "補助金"
-            elif "助成金" in title:
-                grant_type = "助成金"
-            else:
-                grant_type = "補助金"  # デフォルト
-        
-        return {
-            "title": i.get("title") or i.get("name") or "",
-            "summary": i.get("summary") or i.get("description") or "",
-            "source_url": i.get("source_url") or i.get("url") or i.get("link") or "",
-            "grant_type": grant_type,
-            "deadline": i.get("deadline") if i.get("deadline") is not None else None,
-            "amount_max": i.get("amount_max") if i.get("amount_max") is not None else None,
-            "rate_max": i.get("rate_max") if i.get("rate_max") is not None else None,
-            "area": i.get("area") if i.get("area") is not None else None,
-            "municipality": i.get("municipality") if i.get("municipality") is not None else None,
-            "industry": i.get("industry") if i.get("industry") is not None else None,
-            "confidence": float(i.get("confidence", 0.0)) if i.get("confidence") is not None else 0.0,
-            "reasons": i.get("reasons") or [],
-        }
-
-    normalized = [normalize_item(it) for it in items_list][:top_k]
-
-    # フィルタ: source_url が空のものは除外（全件除外される場合は元のリストを使う）
-    filtered = [it for it in normalized if it.get("source_url")]
-    if not filtered:
-        filtered = normalized
-
-    # confidence が 0 の場合はフォールバック値を設定（例: 0.2）
-    for it in filtered:
-        try:
-            conf = float(it.get("confidence", 0.0))
-        except Exception:
-            conf = 0.0
-        if conf == 0.0:
-            it["confidence"] = 0.2
-
+    filtered = utils.normalize_and_filter_items(items_list, top_k)
     return filtered
 
 # ========= ルート =========
