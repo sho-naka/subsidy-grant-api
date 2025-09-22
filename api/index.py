@@ -67,6 +67,8 @@ confidence は 0.0〜1.0 の数値で、情報の信頼度を示してくださ�
             "reasons": ["一次情報に基づく記載あり"]
         }}
     ]
+        # 重要: 条件に合う案件が一件も見つからない場合は、説明文を返さず必ず次の厳密なJSONだけを返してください：{{"items": []}}
+        # それ以外の自由な説明や謝罪文（例: "申し訳ありませんが..."）は絶対に返さないでください。
 }}
 ```
 """.strip()
@@ -161,8 +163,24 @@ async def call_openai(prompt: str, top_k: int):
         parsed_json = json.loads(text)
     except Exception:
         parsed_json = utils.extract_json_from_text(text)
+
+    # パースに失敗した場合、モデルが自然言語で「該当なし」を述べているかを簡易判定します。
     if parsed_json is None:
-        logging.error("Failed to extract/parse JSON from model output. Snippet: %s", text[:1000])
+        text_snip = (text or "")
+        no_result_patterns = [
+            "見つけることができません", "見つかりませんでした", "申し訳ありません",
+            "該当する", "該当なし", "情報がありません", "見つけられませんでした",
+            "該当する情報はありません"
+        ]
+        has_no_result = any(p in text_snip for p in no_result_patterns)
+        # URLを列挙しているような場合も '該当なし' のヒントとみなす
+        has_urls = bool(re.search(r"https?://", text_snip))
+
+        if has_no_result or has_urls:
+            logging.info("Model indicates no results — returning empty items. Snippet: %s", text_snip[:1000])
+            return []
+
+        logging.error("Failed to extract/parse JSON from model output. Snippet: %s", text_snip[:1000])
         raise HTTPException(status_code=502, detail="Model did not return valid JSON")
 
     # Accept either {"items": [...]} or a bare list [...] returned by the model.
