@@ -4,6 +4,7 @@ from pydantic import Field
 from typing import Optional, List
 from .schemas import SearchRequest, GrantItem, SearchResponse
 from . import utils
+from . import rate_limiter
 import os, time
 from openai import OpenAI
 import asyncio
@@ -13,6 +14,31 @@ import logging
 import traceback
 
 app = FastAPI(title="Subsidy API")
+
+
+# シンプルな分レートリミッター（IP単位）
+@app.middleware("http")
+async def simple_rate_limit_middleware(request, call_next):
+    try:
+        xff = request.headers.get("x-forwarded-for")
+        if xff:
+            client_ip = xff.split(",")[0].strip()
+        else:
+            client_ip = request.client.host if request.client else "unknown"
+    except Exception:
+        client_ip = "unknown"
+
+    allowed, remaining = rate_limiter.allow_request(client_ip)
+    if not allowed:
+        from fastapi.responses import JSONResponse
+        return JSONResponse(status_code=429, content={"detail": "Too Many Requests"}, headers={"X-RateLimit-Remaining": str(remaining)})
+
+    resp = await call_next(request)
+    try:
+        resp.headers["X-RateLimit-Remaining"] = str(remaining)
+    except Exception:
+        pass
+    return resp
 
 # MVPは一旦どこからでも許可（公開時はGitHub Pagesのオリジンに絞る）
 app.add_middleware(
